@@ -326,6 +326,18 @@ class Array(Lowerable, metaclass=_ArrayMeta):
     'See :func:`abs`.'
     return abs(self)
 
+  def __matmul__(self, other):
+    if not isarray(other):
+      return NotImplemented
+    if not self.ndim or not other.ndim:
+      raise ValueError('cannot contract zero-dimensional array')
+    if other.ndim == 1:
+      return (self * other).sum(-1)
+    elif self.ndim == 1:
+      return (self[:,numpy.newaxis] * other).sum(-2)
+    else:
+      return (self[...,:,:,numpy.newaxis] * other[...,numpy.newaxis,:,:]).sum(-2)
+
   def sum(self, axis: Optional[Union[int, Sequence[int]]] = None) -> 'Array':
     'See :func:`sum`.'
     return sum(self, axis)
