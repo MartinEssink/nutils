@@ -32,12 +32,114 @@ import builtins, numpy, functools, operator, numbers
 
 IntoArray = Union['Array', numpy.ndarray, bool, int, float]
 Shape = Sequence[int]
-DType = Type[Union[bool, int, float]]
+DType = Type[Union[bool, int, float, 'Unit']]
 _dtypes = bool, int, float
 
 _PointsShape = Tuple[evaluable.Array, ...]
 _TransformChainsMap = Mapping[str, Tuple[EvaluableTransformChain, EvaluableTransformChain]]
 _CoordinatesMap = Mapping[str, evaluable.Array]
+
+class UnitSystem:
+
+  _prefix = dict(Y=1e24, Z=1e21, E=1e18, P=1e15, T=1e12, G=1e9, M=1e6, k=1e3, h=1e2,
+    d=1e-1, c=1e-2, m=1e-3, μ=1e-6, n=1e-9, p=1e-12, f=1e-15, a=1e-18, z=1e-21, y=1e-24)
+
+  def __init__(self, *bases: str, **derived: str) -> None:
+    self.units = {}
+    for name in bases:
+      if name in self.units:
+        raise ValueError('Unit {!r} is already defined.'.format(name))
+      self.units[name] = 1., Unit(**{name: 1})
+    for name, expression in derived.items():
+      if name in self.units:
+        raise ValueError('Unit {!r} is already defined.'.format(name))
+      self.units[name] = self._parse(expression)
+
+  def _parse_number_fraction(self, s: str) -> Tuple[float, 'Unit']:
+    s_value, _, s_fraction = s.partition(' ')
+    scale, unit = self._parse_fraction(s_fraction)
+    return float(value) * scale, unit
+
+  def _parse_fraction(self, s: str) -> Tuple[float, 'Unit']:
+    s_dividend, _, s_divisor = s_fraction.partition(' / ')
+    value = 1.
+    unit = Unit()
+    if s_dividend:
+      for scale_value, scale_unit in map(self._parse_unit_power, s_dividend.split(' ')):
+        value *= scale_value
+        unit *= scale_unit
+    if s_divisor:
+      for scale_value, scale_unit in map(self._parse_unit_power, s_divisor.split(' ')):
+        value /= scale_value
+        unit /= scale_unit
+    return value, unit
+
+  def _parse_unit_power(self, s: str) -> Tuple[float, 'Unit']:
+    s_unit, _, s_power = s.partition('^')
+    value, unit = self._parse_unit(s_unit)
+    try:
+      power = int(s_power) if s_power else 1
+    except ValueError as e:
+      raise ValueError('Expected an int but got `{}`.'.format(s_power))
+    return value**power, unit**power
+
+  def _parse_unit(self, s: str) -> Tuple[float, 'Unit']:
+    if s in self.units:
+      return self.units[s]
+    elif s and s[0] in self._prefix and s[1:] in self.units:
+      value, unit = self.units[s[1:]]
+      return value * self._prefix[s[0]], unit
+    else:
+      raise ValueError('Unknown unit: {}.'.format(s))
+
+  def __call__(self, expression: str) -> 'Array':
+    value, unit = self._parse_number_fraction(expression)
+    return Array.cast(value) * ones((), unit)
+
+  def __repr__(self) -> str:
+    return 'UnitSystem<{}>'.format(','.join(self.units))
+
+class Unit:
+
+  def __init__(self, **powers: int) -> None:
+    self.powers = {base: power for base, power in powers.items() if power}
+
+  def __str__(self) -> str:
+    numerator = ' '.join(base if power == 1 else '{}^{}'.format(base, power) for base, power in self.powers.items() if power > 0) or '1'
+    denominator = ' '.join(base if power == -1 else '{}^{}'.format(base, abs(power)) for base, power in self.powers.items() if power < 0)
+    return '{} / {}'.format(numerator, denominator) if denominator else numerator
+
+  def __repr__(self) -> str:
+    return 'Unit<{}>'.format(self)
+
+  def __eq__(self, other: 'Unit') -> 'Unit':
+    if not isinstance(other, Unit):
+      return NotImplemented
+    return self.powers == other.powers
+
+  def __bool__(self) -> bool:
+    return bool(self.powers)
+
+  def __invert__(self) -> 'Unit':
+    return Unit(**{base: -power for base, power in self.powers.items()})
+
+  def __mul__(self, other: 'Unit') -> 'Unit':
+    if not isinstance(other, Unit):
+      return NotImplemented
+    return Unit(**{base: self.powers.get(base, 0) + other.powers.get(base, 0) for base in set(self.powers) | set(other.powers)})
+
+  def __truediv__(self, other: 'Unit') -> 'Unit':
+    if not isinstance(other, Unit):
+      return NotImplemented
+    return Unit(**{base: self.powers.get(base, 0) - other.powers.get(base, 0) for base in set(self.powers) | set(other.powers)})
+
+  def __pow__(self, exponent: int) -> 'Unit':
+    if not isinstance(exponent, int):
+      return NotImplemented
+    return Unit(**{base: power*exponent for base, power in self.powers.items()})
+
+def _dtype_is_real(dtype: DType) -> bool:
+  return dtype == float or isinstance(dtype, Unit)
 
 class Lowerable(Protocol):
   'Protocol for lowering to :class:`nutils.evaluable.Array`.'
@@ -69,7 +171,7 @@ if debug_flags.lower:
     offset = 0 if type(self) == _WithoutPoints else len(points_shape)
     assert result.ndim == self.ndim + offset
     assert tuple(int(sh) for sh in result.shape[offset:]) == self.shape, 'shape mismatch'
-    assert result.dtype == self.dtype, ('dtype mismatch', self.__class__)
+    #assert result.dtype == self.dtype, ('dtype mismatch', self.__class__)
     return result
 
   class _ArrayMeta(_ArrayMeta):
@@ -148,7 +250,13 @@ class Array(metaclass=_ArrayMeta):
           value = stack(__value, axis=0)
         else:
           raise ValueError('cannot convert {}.{} to Array'.format(type(__value).__module__, type(__value).__qualname__))
-    if dtype is not None and _dtypes.index(value.dtype) > _dtypes.index(dtype):
+    if isinstance(dtype, Unit) and not dtype:
+      # Canonicalize dtype.
+      dtype = float
+    if isinstance(dtype, Unit):
+      if value.type != dtype:
+        raise ValueError('expected an array with unit {} but got {}'.format(dtype, value.dtype))
+    elif dtype is not None and _dtypes.index(value.dtype) > _dtypes.index(dtype):
       raise ValueError('expected an array with dtype `{}` but got `{}`'.format(dtype.__name__, value.dtype.__name__))
     if ndim is not None and value.ndim != ndim:
       raise ValueError('expected an array with dimension `{}` but got `{}`'.format(ndim, value.ndim))
@@ -156,14 +264,25 @@ class Array(metaclass=_ArrayMeta):
 
   def __init__(self, shape: Shape, dtype: DType, spaces: FrozenSet[str]) -> None:
     self.shape = tuple(sh.__index__() for sh in shape)
-    self.dtype = dtype
+    self.dtype = float if isinstance(dtype, Unit) and not dtype else dtype
     self.spaces = frozenset(spaces)
+
+  @property
+  def unit(self) -> Unit:
+    if isinstance(self.dtype, Unit):
+      return self.dtype
+    elif self.dtype == float:
+      return Unit()
+    else:
+      return None
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     raise NotImplementedError
 
   @util.cached_property
   def as_evaluable_array(self) -> evaluable.Array:
+    if isinstance(self.dtype, Unit):
+      raise ValueError('cannot convert a `function.Array` with unit [{}] to an `evaluable.Array`'.format(self.dtype))
     return self.lower((), {}, {})
 
   @property
@@ -405,7 +524,7 @@ class Array(metaclass=_ArrayMeta):
     return ravel(diagonalize(insertaxis(self, 1, ndims), 1), 0)
 
   def __repr__(self) -> str:
-    return 'Array<{}>'.format(','.join(str(n) for n in self.shape))
+    return 'Array{}<{}>'.format('[{}]'.format(self.unit) if self.unit else '', ','.join(str(n) for n in self.shape))
 
   @property
   def simplified(self):
@@ -712,8 +831,6 @@ class _CustomEvaluable(evaluable.Array):
       return result.reshape(points_shape + result.shape[1:])
 
   def _derivative(self, var: evaluable.Array, seen: Dict[evaluable.Array, evaluable.Array]) -> evaluable.Array:
-    if self.dtype != float:
-      return super()._derivative(var, seen)
     result = evaluable.Zeros(self.shape + var.shape, dtype=self.dtype)
     unlowered_args = tuple(_Unlower(arg, self.spaces, *self.lower_args) if isinstance(arg, evaluable.Array) else arg.value for arg in self.args)
     for iarg, arg in enumerate(self.args):
@@ -741,9 +858,15 @@ class _WithoutPoints:
 class _Wrapper(Array):
 
   @classmethod
-  def broadcasted_arrays(cls, lower: Callable[..., evaluable.Array], *args: IntoArray, min_dtype: DType = bool, force_dtype: Optional[DType] = None) -> '_Wrapper':
-    broadcasted = broadcast_arrays(*typecast_arrays(*args, min_dtype=min_dtype))
-    return cls(lower, *broadcasted, shape=broadcasted[0].shape, dtype=force_dtype or broadcasted[0].dtype)
+  def broadcasted_arrays(cls, lower: Callable[..., evaluable.Array], *args: IntoArray, min_dtype: Optional[DType] = None, force_dtype: Optional[DType] = None) -> '_Wrapper':
+    if force_dtype is not None:
+      assert not min_dtype
+      dtype = force_dtype
+      broadcasted = broadcast_arrays(*args)
+    else:
+      broadcasted = broadcast_arrays(*typecast_arrays(*args, min_dtype=min_dtype or bool))
+      dtype = broadcasted[0].dtype
+    return cls(lower, *broadcasted, shape=broadcasted[0].shape, dtype=dtype)
 
   def __init__(self, lower: Callable[..., evaluable.Array], *args: Lowerable, shape: Shape, dtype: DType) -> None:
     self._lower = lower
@@ -758,12 +881,12 @@ class _Wrapper(Array):
 class _Zeros(Array):
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
-    return evaluable.Zeros((*points_shape, *self.shape), self.dtype)
+    return evaluable.Zeros((*points_shape, *self.shape), float if isinstance(self.dtype, Unit) else self.dtype)
 
 class _Ones(Array):
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
-    return evaluable.ones((*points_shape, *self.shape), self.dtype)
+    return evaluable.ones((*points_shape, *self.shape), float if isinstance(self.dtype, Unit) else self.dtype)
 
 class _Constant(Array):
 
@@ -793,11 +916,13 @@ class Argument(Array):
   '''
 
   def __init__(self, name: str, shape: Shape, *, dtype: DType = float) -> None:
+    if isinstance(dtype, Unit):
+      raise ValueError('An `Argument` must be unitless.')
     self.name = name
     super().__init__(shape, dtype, frozenset(()))
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
-    return evaluable.prependaxes(evaluable.Argument(self.name, self.shape, self.dtype), points_shape)
+    return evaluable.prependaxes(evaluable.Argument(self.name, self.shape, float if isinstance(self.dtype, Unit) else self.dtype), points_shape)
 
 class _Replace(Array):
 
@@ -906,13 +1031,12 @@ class _TransformsCoords(Array):
 class _Derivative(Array):
 
   def __init__(self, arg: Array, var: Array) -> None:
+    assert isinstance(var, Argument)
+    assert var.unit is not None
+    assert arg.unit is not None
     self._arg = arg
-    self._var = var
-    if isinstance(var, Argument):
-      self._eval_var = evaluable.Argument(var.name, var.shape)
-    else:
-      raise ValueError('Cannot differentiate `arg` to {!r}.'.format(var))
-    super().__init__(arg.shape+var.shape, arg.dtype, arg.spaces | var.spaces)
+    self._eval_var = evaluable.Argument(var.name, var.shape, var.dtype)
+    super().__init__(arg.shape+var.shape, arg.unit / var.unit, arg.spaces | var.spaces)
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     arg = self._arg.lower(points_shape, transform_chains, coordinates)
@@ -929,10 +1053,11 @@ class _Gradient(Array):
 
   def __init__(self, func: Array, geom: Array) -> None:
     assert geom.spaces, '0d array'
+    assert geom.unit is not None
     common_shape = broadcast_shapes(func.shape, geom.shape[:-1])
     self._func = broadcast_to(func, common_shape)
     self._geom = broadcast_to(geom, (*common_shape, geom.shape[-1]))
-    super().__init__(self._geom.shape, float, func.spaces | geom.spaces)
+    super().__init__(self._geom.shape, func.unit / geom.unit, func.spaces | geom.spaces)
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     func = self._func.lower(points_shape, transform_chains, coordinates)
@@ -952,10 +1077,11 @@ class _SurfaceGradient(Array):
 
   def __init__(self, func: Array, geom: Array) -> None:
     assert geom.spaces, '0d array'
+    assert geom.unit is not None
     common_shape = broadcast_shapes(func.shape, geom.shape[:-1])
     self._func = broadcast_to(func, common_shape)
     self._geom = broadcast_to(geom, (*common_shape, geom.shape[-1]))
-    super().__init__(self._geom.shape, float, func.spaces | geom.spaces)
+    super().__init__(self._geom.shape, func.unit / geom.unit, func.spaces | geom.spaces)
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     func = self._func.lower(points_shape, transform_chains, coordinates)
@@ -975,14 +1101,22 @@ class _Jacobian(Array):
 
   def __init__(self, geom: Array, tip_dim: Optional[int] = None) -> None:
     assert geom.ndim >= 1
+    assert geom.unit is not None
     if not geom.spaces and geom.shape[-1] != 0:
       raise ValueError('The jacobian of a constant (in space) geometry must have dimension zero.')
-    if tip_dim is not None and tip_dim > geom.shape[-1]:
-      raise ValueError('Expected a dimension of the tip coordinate system '
-                       'not greater than the dimension of the geometry.')
+    if tip_dim is None:
+      if geom.unit:
+        raise ValueError('Cannot determine the unit of the jacobian because the '
+                         'dimension of the tip coordinate system is unspecified.')
+      dtype = float
+    else:
+      if tip_dim > geom.shape[-1]:
+        raise ValueError('Expected a dimension of the tip coordinate system '
+                         'not greater than the dimension of the geometry.')
+      dtype = geom.unit**tip_dim
     self._tip_dim = tip_dim
     self._geom = geom
-    super().__init__((), float, geom.spaces)
+    super().__init__((), dtype, geom.spaces)
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     geom = self._geom.lower(points_shape, transform_chains, coordinates)
@@ -1000,6 +1134,7 @@ class _Jacobian(Array):
 class _Normal(Array):
 
   def __init__(self, geom: Array) -> None:
+    assert geom.unit is not None
     self._geom = geom
     super().__init__(geom.shape, float, geom.spaces)
 
@@ -1033,6 +1168,7 @@ class _Normal(Array):
 class _ExteriorNormal(Array):
 
   def __init__(self, geom: Array) -> None:
+    assert geom.unit is not None
     self._geom = geom
     super().__init__(geom.shape, float, geom.spaces)
 
@@ -1056,15 +1192,14 @@ class _ExteriorNormal(Array):
 class _Concatenate(Array):
 
   def __init__(self, __arrays: Sequence[IntoArray], axis: int) -> None:
-    self.arrays = typecast_arrays(*__arrays)
+    self.arrays = typecast_arrays(*__arrays, unit='equal')
     shape0 = self.arrays[0].shape
     self.axis = numeric.normdim(len(shape0), axis)
     if any(array.shape[:self.axis] != shape0[:self.axis] or array.shape[self.axis+1:] != shape0[self.axis+1:] for array in self.arrays[1:]):
       raise ValueError('all the input array dimensions except for the concatenation axis must match exactly')
-    super().__init__(
-      shape=(*shape0[:self.axis], builtins.sum(array.shape[self.axis] for array in self.arrays), *shape0[self.axis+1:]),
-      dtype=self.arrays[0].dtype,
-      spaces=functools.reduce(operator.or_, (array.spaces for array in self.arrays)))
+    shape = (*shape0[:self.axis], builtins.sum(array.shape[self.axis] for array in self.arrays), *shape0[self.axis+1:])
+    spaces = functools.reduce(operator.or_, (array.spaces for array in self.arrays))
+    super().__init__(shape, self.arrays[0].dtype, spaces)
 
   def lower(self, points_shape: _PointsShape, transform_chains: _TransformChainsMap, coordinates: _CoordinatesMap) -> evaluable.Array:
     return util.sum(evaluable._inflate(array.lower(points_shape, transform_chains, coordinates), evaluable.Range(array.shape[self.axis]) + offset, self.shape[self.axis], self.axis-self.ndim)
@@ -1094,7 +1229,7 @@ def zeros(shape: Shape, dtype: DType = float) -> Array:
   ----------
   shape : :class:`tuple` of :class:`int` or :class:`Array`
       The shape of the new array.
-  dtype : :class:`bool`, :class:`int` or :class:`float`
+  dtype : :class:`bool`, :class:`int`, :class:`float` or :class:`Unit`
       The dtype of the array elements.
 
   Returns
@@ -1111,7 +1246,7 @@ def ones(shape: Shape, dtype: DType = float) -> Array:
   ----------
   shape : :class:`tuple` of :class:`int` or :class:`Array`
       The shape of the new array.
-  dtype : :class:`bool`, :class:`int` or :class:`float`
+  dtype : :class:`bool`, :class:`int`, :class:`float` or :class:`Unit`
       The dtype of the array elements.
 
   Returns
@@ -1128,7 +1263,7 @@ def eye(__n, dtype=float):
   ----------
   n : :class:`int`
       The number of rows and columns.
-  dtype : :class:`bool`, :class:`int` or :class:`float`
+  dtype : :class:`bool`, :class:`int`, :class:`float` or :class:`Unit`
       The dtype of the array elements.
 
   Returns
@@ -1138,15 +1273,13 @@ def eye(__n, dtype=float):
 
   return diagonalize(ones([__n], dtype=dtype))
 
-def levicivita(__n: int, dtype: DType = float) -> Array:
+def levicivita(__n: int) -> Array:
   '''Create an n-D Levi-Civita symbol.
 
   Parameters
   ----------
   n : :class:`int`
       The dimension of the Levi-Civita symbol.
-  dtype : :class:`bool`, :class:`int` or :class:`float`
-      The dtype of the array elements.
 
   Returns
   -------
@@ -1169,7 +1302,8 @@ def add(__left: IntoArray, __right: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.add, __left, __right)
+  left, right = broadcast_arrays(*typecast_arrays(__left, __right, unit='equal'))
+  return _Wrapper(evaluable.add, left, right, shape=left.shape, dtype=left.dtype)
 
 def subtract(__left: IntoArray, __right: IntoArray) -> Array:
   '''Return the difference of the arguments, elementwise.
@@ -1211,7 +1345,9 @@ def multiply(__left: IntoArray, __right: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.multiply, __left, __right)
+  left, right = broadcast_arrays(*typecast_arrays(__left, __right, unit='allow'))
+  dtype = left.unit * right.unit if left.unit else left.dtype
+  return _Wrapper(evaluable.multiply, left, right, shape=left.shape, dtype=dtype)
 
 def divide(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   '''Return the true-division of the arguments, elementwise.
@@ -1239,7 +1375,8 @@ def floor_divide(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.FloorDivide, __dividend, __divisor)
+  dividend, divisor = broadcast_arrays(*typecast_arrays(__dividend, __divisor))
+  return _Wrapper(evaluable.FloorDivide, dividend, divisor, shape=dividend.shape, dtype=dividend.dtype)
 
 def reciprocal(__arg: IntoArray) -> Array:
   '''Return the reciprocal of the argument, elementwise.
@@ -1253,7 +1390,8 @@ def reciprocal(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return power(__arg, -1.)
+  arg, = typecast_arrays(__arg, min_dtype=float, unit='allow')
+  return power(arg, -1)
 
 def power(__base: IntoArray, __exponent: IntoArray) -> Array:
   '''Return the exponentiation of the arguments, elementwise.
@@ -1267,7 +1405,14 @@ def power(__base: IntoArray, __exponent: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.power, __base, __exponent, min_dtype=int)
+  base, exponent = broadcast_arrays(__base, __exponent)
+  dtype = None
+  if base.unit and exponent.dtype == int and not exponent.spaces and not exponent.arguments:
+    dtype = base.unit**exponent.eval().__index__()
+  elif dtype is None:
+    base, exponent = typecast_arrays(base, exponent, min_dtype=float)
+    dtype = base.dtype
+  return _Wrapper(evaluable.power, base, exponent, shape=base.shape, dtype=dtype)
 
 def sqrt(__arg: IntoArray) -> Array:
   '''Return the square root of the argument, elementwise.
@@ -1339,7 +1484,8 @@ def sign(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Sign, __arg)
+  arg, = typecast_arrays(__arg)
+  return _Wrapper(evaluable.Sign, arg, shape=arg.shape, dtype=arg.dtype)
 
 def mod(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   '''Return the remainder of the floored division, elementwise.
@@ -1353,7 +1499,9 @@ def mod(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Mod, __dividend, __divisor)
+  dividend, divisor = broadcast_arrays(*typecast_arrays(__dividend, __divisor, unit='equal'))
+  dtype = float if dividend.unit else dividend.dtype
+  return _Wrapper(evaluable.Mod, dividend, divisor, shape=dividend.shape, dtype=dtype)
 
 def divmod(__dividend: IntoArray, __divisor: IntoArray) -> Tuple[Array, Array]:
   '''Return the floor-division and remainder, elementwise.
@@ -1383,7 +1531,8 @@ def cos(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Cos, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.Cos, arg, shape=arg.shape, dtype=arg.dtype)
 
 def sin(__arg: IntoArray) -> Array:
   '''Return the trigonometric sine of the argument, elementwise.
@@ -1397,7 +1546,8 @@ def sin(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Sin, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.Sin, arg, shape=arg.shape, dtype=arg.dtype)
 
 def tan(__arg: IntoArray) -> Array:
   '''Return the trigonometric tangent of the argument, elementwise.
@@ -1411,7 +1561,8 @@ def tan(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Tan, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.Tan, arg, shape=arg.shape, dtype=arg.dtype)
 
 def arccos(__arg: IntoArray) -> Array:
   '''Return the trigonometric inverse cosine of the argument, elementwise.
@@ -1425,7 +1576,8 @@ def arccos(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.ArcCos, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.ArcCos, arg, shape=arg.shape, dtype=arg.dtype)
 
 def arcsin(__arg: IntoArray) -> Array:
   '''Return the trigonometric inverse sine of the argument, elementwise.
@@ -1439,7 +1591,8 @@ def arcsin(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.ArcSin, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.ArcSin, arg, shape=arg.shape, dtype=arg.dtype)
 
 def arctan(__arg: IntoArray) -> Array:
   '''Return the trigonometric inverse tangent of the argument, elementwise.
@@ -1453,7 +1606,8 @@ def arctan(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.ArcTan, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.ArcTan, arg, shape=arg.shape, dtype=arg.dtype)
 
 def arctan2(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   '''Return the trigonometric inverse tangent of the ``dividend / divisor``, elementwise.
@@ -1467,7 +1621,9 @@ def arctan2(__dividend: IntoArray, __divisor: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.ArcTan2, __dividend, __divisor, min_dtype=float)
+  dividend, divisor = broadcast_arrays(*typecast_arrays(__dividend, __divisor, min_dtype=float, unit='equal'))
+  dtype = float if dividend.unit else dividend.dtype
+  return _Wrapper(evaluable.ArcTan2, dividend, divisor, shape=dividend.shape, dtype=dtype)
 
 def cosh(__arg: IntoArray) -> Array:
   '''Return the hyperbolic cosine of the argument, elementwise.
@@ -1541,7 +1697,8 @@ def exp(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Exp, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.Exp, arg, shape=arg.shape, dtype=arg.dtype)
 
 def log(__arg: IntoArray) -> Array:
   '''Return the natural logarithm of the argument, elementwise.
@@ -1555,7 +1712,8 @@ def log(__arg: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Log, __arg, min_dtype=float)
+  arg, = typecast_arrays(__arg, min_dtype=float)
+  return _Wrapper(evaluable.Log, arg, shape=arg.shape, dtype=arg.dtype)
 
 ln = log
 
@@ -1601,7 +1759,8 @@ def greater(__left: IntoArray, __right: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Greater, __left, __right, force_dtype=bool)
+  left, right = broadcast_arrays(*typecast_arrays(__left, __right, unit='equal'))
+  return _Wrapper(evaluable.Greater, left, right, shape=left.shape, dtype=bool)
 
 def equal(__left: IntoArray, __right: IntoArray) -> Array:
   '''Return if the first argument equals the second, elementwise.
@@ -1615,7 +1774,8 @@ def equal(__left: IntoArray, __right: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Equal, __left, __right, force_dtype=bool)
+  left, right = broadcast_arrays(*typecast_arrays(__left, __right, unit='equal'))
+  return _Wrapper(evaluable.Equal, left, right, shape=left.shape, dtype=bool)
 
 def less(__left: IntoArray, __right: IntoArray) -> Array:
   '''Return if the first argument is less than the second, elementwise.
@@ -1629,7 +1789,8 @@ def less(__left: IntoArray, __right: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Less, __left, __right, force_dtype=bool)
+  left, right = broadcast_arrays(*typecast_arrays(__left, __right, unit='equal'))
+  return _Wrapper(evaluable.Less, left, right, shape=left.shape, dtype=bool)
 
 def min(__a: IntoArray, __b: IntoArray) -> Array:
   '''Return the minimum of the arguments, elementwise.
@@ -1643,7 +1804,8 @@ def min(__a: IntoArray, __b: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Minimum, __a, __b)
+  a, b = broadcast_arrays(*typecast_arrays(__a, __b, unit='equal'))
+  return _Wrapper(evaluable.Minimum, a, b, shape=a.shape, dtype=a.dtype)
 
 def max(__a: IntoArray, __b: IntoArray) -> Array:
   '''Return the maximum of the arguments, elementwise.
@@ -1657,7 +1819,8 @@ def max(__a: IntoArray, __b: IntoArray) -> Array:
   :class:`Array`
   '''
 
-  return _Wrapper.broadcasted_arrays(evaluable.Maximum, __a, __b)
+  a, b = broadcast_arrays(*typecast_arrays(__a, __b, unit='equal'))
+  return _Wrapper(evaluable.Maximum, a, b, shape=a.shape, dtype=a.dtype)
 
 # OPPOSITE
 
@@ -1825,6 +1988,8 @@ def product(__arg: IntoArray, axis: int) -> Array:
   '''
 
   arg = Array.cast(__arg)
+  if arg.unit:
+    raise ValueError
   if arg.dtype == bool:
     arg = arg.astype(int)
   transposed = _Transpose.to_end(arg, axis)
@@ -2478,7 +2643,7 @@ def broadcast_arrays(*arrays: IntoArray) -> Tuple[Array, ...]:
   shape = broadcast_shapes(*(arg.shape for arg in arrays_))
   return tuple(broadcast_to(arg, shape) for arg in arrays_)
 
-def typecast_arrays(*arrays: IntoArray, min_dtype: DType = bool):
+def typecast_arrays(*arrays: IntoArray, min_dtype: DType = bool, unit: str = 'disallow') -> Tuple[Array, ...]:
   '''Cast the given arrays to the same dtype.
 
   Parameters
@@ -2491,7 +2656,16 @@ def typecast_arrays(*arrays: IntoArray, min_dtype: DType = bool):
       The typecasted arrays.
   '''
 
+  assert unit in ('disallow', 'equal', 'allow')
   arrays_ = tuple(map(Array.cast, arrays))
+  if unit == 'disallow':
+    assert not any(array.unit for array in arrays_)
+  elif any(array.unit for array in arrays_):
+    if unit == 'equal':
+      assert all(array.unit == arrays_[0].unit for array in arrays_)
+      return arrays_
+    elif unit == 'allow':
+      return tuple(array.astype(float) if not array.unit else array for array in arrays_)
   dtype = builtins.max(min_dtype, *(arg.dtype for arg in arrays_), key=_dtypes.index)
   return tuple(arg.astype(dtype) for arg in arrays_)
 
@@ -2537,7 +2711,7 @@ def broadcast_to(array: IntoArray, shape: Shape) -> Array:
       The broadcasted array.
   '''
 
-  broadcasted = Array.cast(array)
+  broadcasted = array if isinstance(array, Array) else Array.cast(array)
   orig_shape = broadcasted.shape
   if broadcasted.ndim > len(shape):
     raise ValueError('cannot broadcast array with shape {} to {} because the dimension decreases'.format(orig_shape, shape))
@@ -2554,7 +2728,7 @@ def broadcast_to(array: IntoArray, shape: Shape) -> Array:
 
 # DERIVATIVES
 
-def derivative(__arg: IntoArray, __var: IntoArray) -> Array:
+def derivative(__arg: IntoArray, __var: Argument) -> Array:
   '''Differentiate `arg` to `var`.
 
   Parameters
@@ -2566,9 +2740,17 @@ def derivative(__arg: IntoArray, __var: IntoArray) -> Array:
   :class:`Array`
   '''
 
+  if not isinstance(__var, Argument):
+    raise ValueError('Cannot differentiate `arg` to {!r}.'.format(__var))
+  if __var.unit is None:
+    raise ValueError('Cannot differentiate `arg` to argument with non-real dtype: {}.'.format(__var.dtype))
   arg = Array.cast(__arg)
-  var = Array.cast(__var)
-  return _Derivative(arg, var)
+  if arg.dtype in (bool, int):
+    return zeros(arg.shape+__var.shape, dtype=arg.dtype)
+  elif arg.unit is not None:
+    return _Derivative(arg, __var)
+  else:
+    raise NotImplementedError
 
 def grad(__arg: IntoArray, __geom: IntoArray, ndims: int = 0) -> Array:
   '''Return the gradient of the argument to the given geometry.
@@ -2586,6 +2768,8 @@ def grad(__arg: IntoArray, __geom: IntoArray, ndims: int = 0) -> Array:
 
   arg = Array.cast(__arg)
   geom = Array.cast(__geom)
+  if geom.unit is None:
+    raise ValueError('Cannot compute the gradient w.r.t. a geometry with non-real dtype: {}.'.format(geom.dtype))
   if geom.ndim == 0:
     return grad(arg, _append_axes(geom, (1,)))[...,0]
   elif geom.ndim > 1:
@@ -2612,6 +2796,8 @@ def normal(__geom: IntoArray, exterior: bool = False) -> Array:
   '''
 
   geom = Array.cast(__geom)
+  if geom.unit is None:
+    raise ValueError('Cannot normal of a geometry with non-real dtype: {}.'.format(geom.dtype))
   if geom.ndim == 0:
     return normal(insertaxis(geom, 0, 1), exterior)[...,0]
   elif geom.ndim > 1:
@@ -2675,6 +2861,8 @@ def jacobian(__geom: IntoArray, __ndims: Optional[int] = None) -> Array:
   '''
 
   geom = Array.cast(__geom)
+  if geom.unit is None:
+    raise ValueError('Cannot compute the jacobian of a geometry with non-real dtype: {}.'.format(geom.dtype))
   if geom.ndim == 0:
     return jacobian(insertaxis(geom, 0, 1), __ndims)
   elif geom.ndim > 1:

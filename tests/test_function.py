@@ -328,8 +328,10 @@ class Custom(TestCase):
       actual = Multiply(left, right)
       desired = left * right
       self.assertEvalAlmostEqual(actual, desired, **args)
-      self.assertEvalAlmostEqual(actual.derivative('left'), desired.derivative('left'), **args)
-      self.assertEvalAlmostEqual(actual.derivative('right'), desired.derivative('right'), **args)
+      if left.dtype == float:
+        self.assertEvalAlmostEqual(actual.derivative('left'), desired.derivative('left'), **args)
+      if right.dtype == float:
+        self.assertEvalAlmostEqual(actual.derivative('right'), desired.derivative('right'), **args)
 
   def test_multiply_float_float(self):
     self.assertMultipy(numpy.array([[1,2,3],[4,5,6]], float), numpy.array([[2,3,4],[1,2,3]], float))

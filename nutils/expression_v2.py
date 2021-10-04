@@ -251,6 +251,7 @@ class _ArrayOps(Protocol[T]):
   def scope(self, __array: T) -> T: ...
   def mean(self, __array: T) -> T: ...
   def jump(self, __array: T) -> T: ...
+  def unit(self, __expression: str) -> T: ...
   def add(self, *args: Tuple[bool, T]) -> T: ...
   def multiply(self, *args: T) -> T: ...
   def divide(self, __numerator: T, __denominator: T) -> T: ...
@@ -391,9 +392,9 @@ class _Parser(Generic[T]):
   def parse_item(self, s: _Substring, allow_number: bool) -> Tuple[T, _Shape, str, FrozenSet[str]]:
     s_trimmed = s.trim()
     if allow_number:
-      msg = 'Expected a number, variable, scope, mean, jump or function call.'
+      msg = 'Expected a number, variable, scope, mean, jump, unit or function call.'
     else:
-      msg = 'Expected a variable, scope, mean, jump or function call.'
+      msg = 'Expected a variable, scope, mean, jump, unit or function call.'
     if any(op in s_trimmed for op in ('+', '-', '/')):
       msg += ' Hint: the operators `+`, `-` and `/` must be surrounded by spaces.'
     error = ExpressionSyntaxError(msg, s_trimmed or s)
@@ -411,6 +412,9 @@ class _Parser(Generic[T]):
         except ExpressionSyntaxError:
           pass
       raise error
+    # If the expression starts with a hash, we assume this is a unit.
+    if s_trimmed.starts_with('#'):
+      return self.array.unit(str(s_trimmed[1:])), '', frozenset()
     # If the expression contains a scope, partition it and verify that opening
     # and closing parentheses match. If there is no scope, `head` will be the
     # entire expression and `scope` will be empty.
@@ -592,7 +596,8 @@ class Namespace:
   Array<3>
   '''
 
-  def __init__(self) -> None:
+  def __init__(self, *, unit_system: Optional[function.UnitSystem] = None) -> None:
+    super().__setattr__('unit_system', unit_system)
     self.opposite = function.opposite
     self.sin = function.sin
     self.cos = function.cos
@@ -715,6 +720,7 @@ class Namespace:
     '''
 
     ns = Namespace()
+    super().__setattr__('unit_system', self.unit_system)
     for attr, value in vars(self).items():
       if replacements and isinstance(value, function.Array):
         value = function.replace_arguments(value, replacements)
@@ -780,6 +786,10 @@ class _FunctionArrayOps:
 
   def jump(self, array: function.Array) -> function.Array:
     return function.jump(array)
+
+  def unit(self, expression: str) -> function.Array:
+    value, unit = self.namespace.unit_system._parse_unit(expression)
+    return function.Array.cast(value) * function.ones((), dtype=unit)
 
   def add(self, *args: Tuple[bool, function.Array]) -> function.Array:
     assert all(arg.shape == args[0][1].shape for neg, arg in args[1:])
