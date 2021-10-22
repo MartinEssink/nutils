@@ -104,6 +104,15 @@ class _ArrayMeta(_ArrayMeta):
       namespace['lower'] = _cache_lower
     return super().__new__(mcls, name, bases, namespace)
 
+class Unity:
+  def __call__(self, magnitude):
+    return magnitude
+  def __truediv__(self, other):
+    return other**-1
+  def __mul__(self, other):
+    return other
+  def __pow__(self, other):
+    return self
 
 class Array(numpy.lib.mixins.NDArrayOperatorsMixin, metaclass=_ArrayMeta):
   '''Base class for array valued functions.
@@ -176,6 +185,13 @@ class Array(numpy.lib.mixins.NDArrayOperatorsMixin, metaclass=_ArrayMeta):
     if ndim is not None and value.ndim != ndim:
       raise ValueError('expected an array with dimension `{}` but got `{}`'.format(ndim, value.ndim))
     return value
+
+  @classmethod
+  def cast_withscale(cls, __value: IntoArray, dtype: Optional[DType] = None, ndim: Optional[int] = None):
+    if hasattr(__value, 'magnitude'):
+        return cls.cast(__value.magnitude, dtype=dtype, ndim=ndim), type(__value)
+    else:
+        return cls.cast(__value, dtype=dtype, ndim=ndim), Unity()
 
   def __init__(self, shape: Shape, dtype: DType, spaces: FrozenSet[str], arguments: Mapping[str, Tuple[Shape, DType]]) -> None:
     self.shape = tuple(sh.__index__() for sh in shape)
@@ -2731,7 +2747,7 @@ def derivative(__arg: IntoArray, __var: Union[str, 'Argument']) -> Array:
   :class:`Array`
   '''
 
-  arg = Array.cast(__arg)
+  arg, argscale = Array.cast_withscale(__arg)
   if isinstance(__var, str):
     if __var not in arg.arguments:
       raise ValueError('no such argument: {}'.format(__var))
@@ -2745,7 +2761,7 @@ def derivative(__arg: IntoArray, __var: Union[str, 'Argument']) -> Array:
       raise ValueError('Argument {!r} has shape {} in the function, but the derivative to {!r} with shape {} was requested.'.format(__var.name, shape, __var.name, __var.shape))
     if __var.dtype != dtype:
       raise ValueError('Argument {!r} has dtype {} in the function, but the derivative to {!r} with dtype {} was requested.'.format(__var.name, dtype.__name__ if dtype in _dtypes else dtype, __var.name, __var.dtype.__name__ if __var.dtype in _dtypes else __var.dtype))
-  return _Derivative(arg, __var)
+  return argscale(_Derivative(arg, __var))
 
 def grad(__arg: IntoArray, __geom: IntoArray, ndims: int = 0) -> Array:
   '''Return the gradient of the argument to the given geometry.
@@ -2761,21 +2777,22 @@ def grad(__arg: IntoArray, __geom: IntoArray, ndims: int = 0) -> Array:
   :class:`Array`
   '''
 
-  arg = Array.cast(__arg)
-  geom = Array.cast(__geom)
+  arg, argscale = Array.cast_withscale(__arg)
+  geom, geomscale = Array.cast_withscale(__geom)
   if geom.dtype != float:
     raise ValueError('The geometry must be real-valued.')
   if geom.ndim == 0:
-    return grad(arg, _append_axes(geom, (1,)))[...,0]
+    ret = grad(arg, _append_axes(geom, (1,)))[...,0]
   elif geom.ndim > 1:
     sh = geom.shape[-2:]
-    return unravel(grad(arg, ravel(geom, geom.ndim-2)), arg.ndim+geom.ndim-2, sh)
+    ret = unravel(grad(arg, ravel(geom, geom.ndim-2)), arg.ndim+geom.ndim-2, sh)
   elif ndims == 0 or ndims == geom.shape[0]:
-    return _Gradient(arg, geom)
+    ret = _Gradient(arg, geom)
   elif ndims == -1 or ndims == geom.shape[0] - 1:
-    return _SurfaceGradient(arg, geom)
+    ret = _SurfaceGradient(arg, geom)
   else:
     raise NotImplementedError
+  return (argscale / geomscale)(ret)
 
 def curl(__arg: IntoArray, __geom: IntoArray) -> Array:
   '''Return the curl of the argument w.r.t. the given geometry.
@@ -2814,7 +2831,7 @@ def normal(__geom: IntoArray, exterior: bool = False) -> Array:
   :class:`Array`
   '''
 
-  geom = Array.cast(__geom)
+  geom, geomscale_ = Array.cast_withscale(__geom)
   if geom.dtype != float:
     raise ValueError('The geometry must be real-valued.')
   if geom.ndim == 0:
@@ -2879,15 +2896,16 @@ def jacobian(__geom: IntoArray, __ndims: Optional[int] = None) -> Array:
   :class:`Array`
   '''
 
-  geom = Array.cast(__geom)
+  geom, geomscale = Array.cast_withscale(__geom)
   if geom.dtype != float:
     raise ValueError('The geometry must be real-valued.')
   if geom.ndim == 0:
-    return jacobian(insertaxis(geom, 0, 1), __ndims)
+    J = jacobian(insertaxis(geom, 0, 1), __ndims)
   elif geom.ndim > 1:
-    return jacobian(ravel(geom, geom.ndim-2), __ndims)
+    J = jacobian(ravel(geom, geom.ndim-2), __ndims)
   else:
-    return _Jacobian(geom, __ndims)
+    J = _Jacobian(geom, __ndims)
+  return (geomscale**__ndims)(J)
 
 def J(__geom: IntoArray, __ndims: Optional[int] = None) -> Array:
   '''Return the absolute value of the determinant of the Jacobian matrix of the given geometry.
@@ -3035,7 +3053,8 @@ def eval(funcs: evaluable.AsEvaluableArray, **arguments: Mapping[str, numpy.ndar
   results : :class:`tuple` of arrays
   '''
 
-  return map(sparse.toarray, evaluable.eval_sparse(funcs, **arguments))
+  funcs, funcscales = zip(*map(Array.cast_withscale, funcs))
+  return tuple(scale(sparse.toarray(data)) for data, scale in zip(evaluable.eval_sparse(funcs, **arguments), funcscales))
 
 def isarray(__arg: Any) -> bool:
   'Test if the argument is an instance of :class:`Array`.'
