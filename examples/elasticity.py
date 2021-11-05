@@ -6,6 +6,7 @@
 
 from nutils import mesh, function, solver, export, cli, testing
 from nutils.expression_v2 import Namespace
+import numpy
 
 def main(nelems:int, etype:str, btype:str, degree:int, poisson:float):
   '''
@@ -32,26 +33,34 @@ def main(nelems:int, etype:str, btype:str, degree:int, poisson:float):
   ns.δ = function.eye(domain.ndims)
   ns.x = geom
   ns.define_for('x', gradient='∇', normal='n', jacobians=('dV', 'dS'))
-  ns.basis = domain.basis(btype, degree=degree).vector(2)
-  ns.u = function.dotarg('lhs', ns.basis)
+  ns.basis = domain.basis(btype, degree=degree)
+  ns.u = function.dotarg('u', ns.basis, shape=(2,))
+  ns.t = function.dotarg('t', ns.basis, shape=(2,))
   ns.X_i = 'x_i + u_i'
-  ns.lmbda = 2 * poisson
-  ns.mu = 1 - 2 * poisson
-  ns.strain_ij = '(∇_j(u_i) + ∇_i(u_j)) / 2'
-  ns.stress_ij = 'lmbda strain_kk δ_ij + 2 mu strain_ij'
+  ns.μ = .5/poisson - 1
+  ns.E = '∇_i(u_i) ∇_j(u_j) + μ ∇_i(u_j) ∇_j(u_i) + μ ∇_i(u_j) ∇_i(u_j)'
 
   sqr = domain.boundary['left'].integral('u_k u_k dS' @ ns, degree=degree*2)
-  sqr += domain.boundary['right'].integral('(u_0 - .5)^2 dS' @ ns, degree=degree*2)
-  cons = solver.optimize('lhs', sqr, droptol=1e-15)
+  cons = solver.optimize(['u'], sqr, droptol=1e-15)
 
-  res = domain.integral('∇_j(basis_ni) stress_ij dV' @ ns, degree=degree*2)
-  lhs = solver.solve_linear('lhs', res, constrain=cons)
+  energy = domain.integral('E dV' @ ns, degree=degree*2)
+  work = domain.boundary['right'].integral('u_i n_i dS' @ ns, degree=degree*2)
+  state = solver.optimize(['u'], energy - work, constrain=cons)
+
+  clamp_work = domain.boundary['left'].integral('u_i t_i dS' @ ns, degree=degree*2)
+  invcons = dict(t=numpy.choose(numpy.isnan(cons['u']), [numpy.nan, 0.]))
+  state = solver.solve_linear(['t'], [(energy - clamp_work).derivative('u')], constrain=invcons, arguments=state)
 
   bezier = domain.sample('bezier', 5)
-  X, sxy = bezier.eval(['X_i', 'stress_01'] @ ns, lhs=lhs)
-  export.triplot('shear.png', X, sxy, tri=bezier.tri, hull=bezier.hull)
+  X, E = bezier.eval(['X_i', 'E'] @ ns, **state)
+  Xt, t = domain.boundary['left'].sample('uniform', 3).eval(['X_i', 't_i'] @ ns, **state)
+  with export.mplfigure('shear.png') as fig:
+    ax = fig.add_subplot(111, xlim=(-.25,1.25), aspect='equal')
+    im = ax.tripcolor(*X.T, bezier.tri, E, shading='gouraud', rasterized=True)
+    ax.quiver(*Xt.T, *t.T)
+    fig.colorbar(im)
 
-  return cons, lhs
+  return cons, state
 
 # If the script is executed (as opposed to imported), :func:`nutils.cli.run`
 # calls the main function with arguments provided from the command line. For
@@ -72,39 +81,47 @@ class test(testing.TestCase):
 
   @testing.requires('matplotlib')
   def test_default(self):
-    cons, lhs = main(nelems=4, etype='square', btype='std', degree=1, poisson=.25)
-    with self.subTest('constraints'): self.assertAlmostEqual64(cons, '''
-      eNpjYMACGsiHP0wxMQBKlBdi''')
-    with self.subTest('left-hand side'): self.assertAlmostEqual64(lhs, '''
-      eNpjYMAEKcaiRmLGQQZCxgwMYsbrzqcYvz672KTMaIKJimG7CQPDBJM75xabdJ3NMO0xSjG1MUw0Beox
-      PXIuw7Tk7A/TXqMfQLEfQLEfQLEfpsVnAUzzHtI=''')
+    cons, state = main(nelems=4, etype='square', btype='std', degree=1, poisson=.25)
+    with self.subTest('constraints'): self.assertAlmostEqual64(cons['u'], '''
+      eNpjYMACGqgLASCRFAE=''')
+    with self.subTest('displacement'): self.assertAlmostEqual64(state['u'], '''
+      eNpjYMAEBYYKBkqGMXqyhgwMSoZLLhYYPji/wajBYI6Rjv4kIwaGOUZXLgD550uNpxvkG7voZxszMOQb
+      77lQapx5ns1kkQGzSZA+owkDA7PJugtsJnHnATXSGpw=''')
+    with self.subTest('traction'): self.assertAlmostEqual64(state['t'], '''
+      eNoTObHnJPvJeoP9JxgY2E82nhc54WLGQGUAACftCN4=''')
 
   @testing.requires('matplotlib')
   def test_mixed(self):
-    cons, lhs = main(nelems=4, etype='mixed', btype='std', degree=1, poisson=.25)
-    with self.subTest('constraints'): self.assertAlmostEqual64(cons, '''
-      eNpjYICCBiiEsdFpIuEPU0wMAG6UF2I=''')
-    with self.subTest('left-hand side'): self.assertAlmostEqual64(lhs, '''
-      eNpjYICAJGMOI3ljcQMwx3i/JohSMr51HkQnGP8422eiYrjcJM+o3aToWq/Jy3PLTKafzTDtM0oxtTRM
-      MF2okmJ67lyGacnZH6aOhj9Mu41+mMZq/DA9dO6HaflZAAMdIls=''')
+    cons, state = main(nelems=4, etype='mixed', btype='std', degree=1, poisson=.25)
+    with self.subTest('constraints'): self.assertAlmostEqual64(cons['u'], '''
+      eNpjYICCBiiEsdFpCiAARJEUAQ==''')
+    with self.subTest('solution'): self.assertAlmostEqual64(state['u'], '''
+      eNpjYICAPEMhAy1DBT0Qm9vwnDqI1jW8dBFE5xi+Oz/LSEt/s1G5wUSjyTdmGD25sMmo/3yZ8UyDfGMn
+      /UzjJ6p5xsculBrnnGc2idNnN1lmwGDCpcZksuECm0nCeQD9cB5S''')
+    with self.subTest('traction'): self.assertAlmostEqual64(state['t'], '''
+      eNrjPXH7pMbJJ+cZoGDyCYvLIFr7pJEBiOY+oW3GQCEAAGUgCg4=''')
 
   @testing.requires('matplotlib')
   def test_quadratic(self):
-    cons, lhs = main(nelems=4, etype='square', btype='std', degree=2, poisson=.25)
-    with self.subTest('constraints'): self.assertAlmostEqual64(cons, '''
-      eNpjYCACNIxc+MOUMAYA/+NOFg==''')
-    with self.subTest('left-hand side'): self.assertAlmostEqual64(lhs, '''
-      eNqFzL9KA0EQx/HlLI5wprBJCol/rtfN7MxobZEXOQIJQdBCwfgAItwVStQmZSAvcOmtVW6z5wP4D2yE
-      aKOwEhTnDRz4VvPhp9T/1zeP0ILF5hhSnUK5cQlKpaDvx3DoWvA57Zt128PIMO5CjHvNOn5s1lCpOi6V
-      MZ5PGS/k/1U0qGcqVMIcQ5jhmX4XM8N9N8dvWyFtG3RVjOjADOkNBrQMGV3rlJTKaMcN6NUOqWZHlBVV
-      PjER/0DIDAE/6ICVCjh2Id/ZiBdslY+LrpiOmLaYhJ90IibhNdcW0xHTFTPhUzPhX8h5W3rRuZicV1zO
-      N3bCgXRUeDFedjxvSc/ai/G86jzfWi87Xswfg5Nx3Q==''')
+    cons, state = main(nelems=4, etype='square', btype='std', degree=2, poisson=.25)
+    with self.subTest('constraints'): self.assertAlmostEqual64(cons['u'], '''
+      eNpjYCACNIxCfBAAg5xIAQ==''')
+    with self.subTest('solution'): self.assertAlmostEqual64(state['u'], '''
+      eNqFzT9LwlEUxvFLIj/FQQjLftGmtNj1nHvOHZqK8A0EvoKWwCEFQRRaWsJaazBbkja3AufEbGi711tT
+      1Np/2oSUiO476Fk/X3iE+H9N/IQihPketGQbHnPnIEQbsvc9KLkivIyamLINlcaCagCo3XxWTVYySois
+      Cu5A7Y8K6sD7m8lRHdP0BHGahak6lT++maptF6cvm6aMzdGhuaQ97NIYOrQMbbqVJ+S/aNV16MF2KWG9
+      myU+wpADTPEaJPlZJlmIJC+6FF/bkCfey6bOx1jjGFZ5HSr8Ksu+qfCCq/LA1vjb+4654RYOOYED3oA+
+      v8sr3/R53g24b4c89l4yMX2GgZ7DqN6EiP6VES1ERM+4qL6wgf7wvmX+AN5xajA=''')
+    with self.subTest('traction'): self.assertAlmostEqual64(state['t'], '''
+      eNpbejz8pNcpFdO5J26d5jy5y+DwCQYGzpNu5+eeUDPxOnXn1NLjK80YRgFeAAC0chL2''')
 
   @testing.requires('matplotlib')
   def test_poisson(self):
-    cons, lhs = main(nelems=4, etype='square', btype='std', degree=1, poisson=.4)
-    with self.subTest('constraints'): self.assertAlmostEqual64(cons, '''
-      eNpjYMACGsiHP0wxMQBKlBdi''')
-    with self.subTest('left-hand side'): self.assertAlmostEqual64(lhs, '''
-      eNpjYMAEFsaTjdcYvTFcasTAsMZI5JyFce6ZKSavjbNMFhhFmDAwZJkknJ1iInom0ZTJJNx0q1GgKQND
-      uKn32UTTf6d/mLKY/DDdZvQDKPbD1OvsD9M/pwGZyh9l''')
+    cons, state = main(nelems=4, etype='square', btype='std', degree=1, poisson=.4)
+    with self.subTest('constraints'): self.assertAlmostEqual64(cons['u'], '''
+      eNpjYMACGqgLASCRFAE=''')
+    with self.subTest('solution'): self.assertAlmostEqual64(state['u'], '''
+      eNpjYMAEOcZHje8byRhdN2JguG/05GyOsfWZkyYyJnNMzhl1mDAwzDExOnvS5MnpmaYmJp2mj4waTBkY
+      Ok3lzs40PXPayMzRRMvsg5GaGQODlpnAWSOz/acBAbAecQ==''')
+    with self.subTest('traction'): self.assertAlmostEqual64(state['t'], '''
+      eNrbdFz7ROrJs8aHTjAwpJ40PrPp+FVzBioDANbTCtc=''')
